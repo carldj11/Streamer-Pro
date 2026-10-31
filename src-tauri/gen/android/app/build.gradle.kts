@@ -30,7 +30,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.infinitel8p.xtream"
+        applicationId = "com.streamerpro.player"
         minSdk = 26
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -67,6 +67,7 @@ android {
         signingConfigs {
             create("release") {
                 storeFile = file(keystoreFile)
+                storeType = "PKCS12"
                 storePassword = required("XTREAM_KEYSTORE_PASSWORD")
                 keyAlias = required("XTREAM_KEY_ALIAS")
                 keyPassword = required("XTREAM_KEY_PASSWORD")

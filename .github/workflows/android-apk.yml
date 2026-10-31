@@ -1,0 +1,149 @@
+name: Android ARM64 APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build signed Android ARM64 APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0 ndk;29.0.13846066"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: android-arm64
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Decode Android signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::Configure ANDROID_KEYSTORE_BASE64 and the Android signing secrets before building."
+            exit 1
+          fi
+          KEYSTORE_PATH="$RUNNER_TEMP/streamer-pro-release.p12"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          echo "XTREAM_KEYSTORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Verify PKCS#12 keystore and alias
+        env:
+          XTREAM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          XTREAM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$XTREAM_KEY_ALIAS" != "streamerpro" ]; then
+            echo "::error::ANDROID_KEY_ALIAS must identify the Streamer Pro signing key."
+            exit 1
+          fi
+          keytool -list -keystore "$XTREAM_KEYSTORE_FILE" -storetype PKCS12 \
+            -storepass "$XTREAM_KEYSTORE_PASSWORD" -alias streamerpro >/dev/null 2>&1 || {
+              echo "::error::PKCS#12 keystore could not be opened with the configured password and alias."
+              exit 1
+            }
+
+      - name: Set increasing test versionCode
+        shell: bash
+        run: echo "XTREAM_VERSION_CODE_OVERRIDE=$((110000000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - name: Build signed ARM64 APK
+        env:
+          XTREAM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          XTREAM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          XTREAM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.13846066
+          XT_SKIP_FFMPEG_SIDECAR: "1"
+        run: pnpm tauri android build --apk --target aarch64
+
+      - name: Collect APK
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*release*.apk' -printf '%T@\t%p\n' | sort -rn | head -1 | cut -f2-)
+          if [ -z "$APK" ]; then
+            echo "::error::Could not locate the signed release APK after build."
+            find src-tauri/gen/android/app/build/outputs -type f
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/streamer-pro-apk"
+          cp "$APK" "$RUNNER_TEMP/streamer-pro-apk/Streamer-Pro-arm64.apk"
+          echo "path=$RUNNER_TEMP/streamer-pro-apk/Streamer-Pro-arm64.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK signature, identity, version, and ARM64 library
+        env:
+          XTREAM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          XTREAM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$RUNNER_TEMP/streamer-pro-apk/Streamer-Pro-arm64.apk"
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+
+          "$BUILD_TOOLS/apksigner" verify --verbose "$APK"
+          APK_CERT_SHA256=$("$BUILD_TOOLS/apksigner" verify --print-certs "$APK" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+            | head -n 1 | tr '[:upper:]' '[:lower:]')
+          KEY_CERT_SHA256=$(keytool -list -v -keystore "$XTREAM_KEYSTORE_FILE" -storetype PKCS12 \
+            -alias "$XTREAM_KEY_ALIAS" -storepass "$XTREAM_KEYSTORE_PASSWORD" \
+            | sed -n 's/^[[:space:]]*SHA256: //p' | head -n 1 \
+            | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if [ -z "$APK_CERT_SHA256" ] || [ "$APK_CERT_SHA256" != "$KEY_CERT_SHA256" ]; then
+            echo "::error::APK signer does not match the configured Streamer Pro keystore."
+            exit 1
+          fi
+
+          BADGING=$("$BUILD_TOOLS/aapt" dump badging "$APK")
+          if ! printf '%s\n' "$BADGING" | grep -q "^package: name='com.streamerpro.player'"; then
+            echo "::error::APK package ID is not com.streamerpro.player."
+            exit 1
+          fi
+          VERSION_CODE=$(printf '%s\n' "$BADGING" \
+            | sed -n "s/^package: .*versionCode='\\([^']*\\)'.*/\\1/p" | head -n 1)
+          EXPECTED_VERSION_CODE=$((110000000 + GITHUB_RUN_NUMBER))
+          if [ "$VERSION_CODE" != "$EXPECTED_VERSION_CODE" ]; then
+            echo "::error::APK versionCode does not match this workflow run."
+            exit 1
+          fi
+          if ! unzip -Z1 "$APK" | grep -qE '^lib/arm64-v8a/[^/]+\.so$'; then
+            echo "::error::APK does not contain an ARM64 native library."
+            exit 1
+          fi
+
+      - name: Upload installable APK artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: streamer-pro-android-arm64-apk
+          path: ${{ steps.collect.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
